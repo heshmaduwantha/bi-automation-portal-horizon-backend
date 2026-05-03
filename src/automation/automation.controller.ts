@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Body, Param } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Param, Query } from '@nestjs/common';
 import { AutomationService } from './automation.service';
 import { AutomationTask } from './entities/automation-task.entity';
 
@@ -17,8 +17,8 @@ export class AutomationController {
   }
 
   @Post('tasks/:id/run')
-  manualRun(@Param('id') id: string) {
-    return this.automationService.executeTask(+id);
+  manualRun(@Param('id') id: string, @Query('limit') limit: number = 1000) {
+    return this.automationService.executeTask(+id, Number(limit));
   }
 
   @Delete('tasks/:id')

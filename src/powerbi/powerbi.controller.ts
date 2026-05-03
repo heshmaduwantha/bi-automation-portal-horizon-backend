@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Param, Query } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, Body } from '@nestjs/common';
 import { PowerbiService } from './powerbi.service';
 
 @Controller('powerbi')
@@ -7,8 +7,12 @@ export class PowerbiController {
 
   // ─── Reports ─────────────────────────────────────────────────────
   @Get('reports')
-  getReports() {
-    return this.powerbiService.getReports();
+  getReports(
+    @Query('page') page: number = 1,
+    @Query('limit') limit: number = 10,
+    @Query('search') search: string = '',
+  ) {
+    return this.powerbiService.getPagedReports(Number(page), Number(limit), search);
   }
 
   @Get('search-cache')
@@ -48,9 +52,25 @@ export class PowerbiController {
     return this.powerbiService.getDatasetById(id);
   }
 
+  @Get('datasets/:id/tables')
+  getDatasetTables(@Param('id') id: string) {
+    return this.powerbiService.getDatasetTables(id);
+  }
+
   @Get('datasets/:id/schema')
-  getDatasetSchema(@Param('id') id: string) {
-    return this.powerbiService.getDatasetSchema(id);
+  getDatasetSchema(
+    @Param('id') id: string,
+    @Query('tableName') tableName?: string
+  ) {
+    return this.powerbiService.getDatasetSchema(id, tableName);
+  }
+
+  @Post('datasets/:id/execute-query')
+  executeQuery(
+    @Param('id') id: string,
+    @Body('query') query: string
+  ) {
+    return this.powerbiService.executeDatasetQuery(id, query);
   }
 
   // ─── Refresh ─────────────────────────────────────────────────────

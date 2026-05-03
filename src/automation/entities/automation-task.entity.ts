@@ -18,7 +18,10 @@ export class AutomationTask {
   datasetId: string;
 
   @Column({ nullable: true })
-  tableName: string; // The auto-created table name
+  tableName: string; // The auto-created SQL table name
+
+  @Column({ nullable: true })
+  pbiTableName: string; // The original Power BI table name
 
   @Column('simple-array')
   primaryKeys: string[]; // User selected PKs

@@ -4,7 +4,7 @@ import { ValidationPipe } from '@nestjs/common';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
 
-dotenv.config({ path: join(__dirname, '../.env') });
+dotenv.config();
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -15,7 +15,9 @@ async function bootstrap() {
     exposedHeaders: 'Content-Range,X-Content-Range',
   });
   app.useGlobalPipes(new ValidationPipe());
-  await app.listen(process.env.APP_PORT ?? 4020);
-  console.log(`Server running on port ${process.env.APP_PORT ?? 4020}`);
+  const port = 4020;
+  await app.listen(port);
+
+  console.log(`Server running on port ${port}`);
 }
 bootstrap();

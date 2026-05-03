@@ -29,18 +29,23 @@ export class AutomationService implements OnApplicationBootstrap {
 
   // ─── Task Management ──────────────────────────────────────────────
   async createSchedule(data: Partial<AutomationTask>) {
-    // 0. Check for duplicates
-    const existing = await this.taskRepository.findOneBy({ reportId: data.reportId });
+    // 0. Check for duplicates (Report + Table)
+    const existing = await this.taskRepository.findOneBy({ 
+      reportId: data.reportId,
+      pbiTableName: data.pbiTableName 
+    });
+    
     if (existing) {
-       throw new Error(`Report "${data.reportName}" is already scheduled.`);
+       throw new Error(`Table "${data.pbiTableName}" in report "${data.reportName}" is already scheduled.`);
     }
 
     // 1. Get Schema
-    const schema = await this.powerbiService.getDatasetSchema(data.datasetId!);
+    const schema = await this.powerbiService.getDatasetSchema(data.datasetId!, data.pbiTableName);
     
-    // 2. Create target table name
+    // 2. Create target table name (dashboard_name_tablename)
     const sanitizedReportName = (data.reportName || 'unknown').toLowerCase().replace(/[^a-z0-9]/g, '_');
-    const tableName = `pbi_export_${sanitizedReportName}_${Date.now()}`;
+    const sanitizedTableName = (data.pbiTableName || 'unknown').toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const tableName = `pbi_${sanitizedReportName}_${sanitizedTableName}`;
     data.tableName = tableName;
 
     // 3. Create table in DB
@@ -74,17 +79,20 @@ export class AutomationService implements OnApplicationBootstrap {
   }
 
   // ─── Execution Logic ──────────────────────────────────────────────
-  async executeTask(taskId: number) {
+  async executeTask(taskId: number, limit: number = 10000) {
     const task = await this.taskRepository.findOneBy({ id: taskId });
     if (!task) return;
 
     try {
-      this.logger.log(`Executing automation task: ${task.reportName}`);
+      this.logger.log(`Executing automation task: ${task.reportName} - ${task.pbiTableName}`);
       await this.taskRepository.update(taskId, { status: 'Running' });
 
-      // 1. Fetch Data (For the "Main Table")
-      // In a real scenario, we'd EVALUATE the main table name. For mock, we get sample rows.
-      const dax = `EVALUATE TOPNS(1000, '${task.reportName}')`; 
+      // 1. Fetch Data
+      // Use clean table name (strip $ if present for DAX)
+      let daxTableName = task.pbiTableName;
+      if (daxTableName.startsWith('$')) daxTableName = daxTableName.substring(1);
+
+      const dax = `EVALUATE TOPN(${limit}, '${daxTableName}')`; 
       const queryResult = await this.powerbiService.executeDatasetQuery(task.datasetId, dax);
       const rows = queryResult.results[0].tables[0].rows;
 
@@ -146,21 +154,22 @@ export class AutomationService implements OnApplicationBootstrap {
     await queryRunner.connect();
 
     try {
-      const keys = Object.keys(rows[0]);
-      const columns = keys.map(k => `"${k}"`).join(', ');
+      const originalKeys = Object.keys(rows[0]);
+      const sanitizedKeys = originalKeys.map(k => this.powerbiService.sanitizeName(k));
+      const columnsSql = sanitizedKeys.map(k => `"${k}"`).join(', ');
       
       for (const row of rows) {
-        const values = keys.map(k => {
+        const valuesSql = originalKeys.map(k => {
           const val = row[k];
           if (typeof val === 'string') return `'${val.replace(/'/g, "''")}'`;
           if (val === null) return 'NULL';
           return val;
         }).join(', ');
-
-        let sql = `INSERT INTO "${tableName}" (${columns}) VALUES (${values})`;
+ 
+        let sql = `INSERT INTO "${tableName}" (${columnsSql}) VALUES (${valuesSql})`;
         
         if (pks && pks.length > 0) {
-          const updateSet = keys
+          const updateSet = sanitizedKeys
             .filter(k => !pks.includes(k)) // Don't update the PKs themselves
             .map(k => `"${k}" = EXCLUDED."${k}"`)
             .join(', ');

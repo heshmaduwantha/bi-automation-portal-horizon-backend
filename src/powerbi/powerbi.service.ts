@@ -94,13 +94,39 @@ export class PowerbiService {
   async getReports(): Promise<PowerBIReport[]> {
     if (this.useMock) return this.getMockReports();
 
-    const token = await this.getAccessToken();
-    const response = await firstValueFrom(
-      this.httpService.get('https://api.powerbi.com/v1.0/myorg/reports', {
-        headers: { Authorization: `Bearer ${token}` },
-      }),
-    );
-    return response.data.value;
+    const workspaces = await this.getWorkspaces();
+    const allReports: PowerBIReport[] = [];
+    
+    for (const workspace of workspaces) {
+      try {
+        const reports = await this.getReportsInGroup(workspace.id);
+        allReports.push(...reports);
+      } catch (e) {
+        this.logger.warn(`Could not fetch reports for workspace ${workspace.id}: ${e.message}`);
+      }
+    }
+    return allReports;
+  }
+
+  async getPagedReports(page: number, limit: number, search: string = '') {
+    const query = this.cacheRepository.createQueryBuilder('report');
+    
+    if (search) {
+      query.where('LOWER(report.name) LIKE LOWER(:search)', { search: `%${search}%` });
+    }
+    
+    const [data, total] = await query
+      .orderBy('report.name', 'ASC')
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getManyAndCount();
+
+    return {
+      data,
+      total,
+      page,
+      lastPage: Math.ceil(total / limit),
+    };
   }
 
   async getReportsInGroup(groupId: string): Promise<PowerBIReport[]> {
@@ -153,13 +179,18 @@ export class PowerbiService {
       return datasets;
     }
 
-    const token = await this.getAccessToken();
-    const response = await firstValueFrom(
-      this.httpService.get('https://api.powerbi.com/v1.0/myorg/datasets', {
-        headers: { Authorization: `Bearer ${token}` },
-      }),
-    );
-    return response.data.value;
+    const workspaces = await this.getWorkspaces();
+    const allDatasets: PowerBIDataset[] = [];
+
+    for (const workspace of workspaces) {
+      try {
+        const datasets = await this.getDatasetsInGroup(workspace.id);
+        allDatasets.push(...datasets);
+      } catch (e) {
+        this.logger.warn(`Could not fetch datasets for workspace ${workspace.id}: ${e.message}`);
+      }
+    }
+    return allDatasets;
   }
 
   async getDatasetById(datasetId: string): Promise<PowerBIDataset> {
@@ -170,17 +201,78 @@ export class PowerbiService {
     }
 
     const token = await this.getAccessToken();
-    const response = await firstValueFrom(
-      this.httpService.get(`https://api.powerbi.com/v1.0/myorg/datasets/${datasetId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      }),
-    );
-    return response.data;
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get(`https://api.powerbi.com/v1.0/myorg/datasets/${datasetId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      );
+      return response.data;
+    } catch (e) {
+      this.logger.error(`Failed to get dataset info for ${datasetId}: ${JSON.stringify(e.response?.data || e.message)}`);
+      // Return a basic object if info fetch fails, to prevent blocking the flow
+      return {
+        id: datasetId,
+        name: 'Power BI Dataset',
+        webUrl: '',
+        configuredBy: '',
+        isRefreshable: true,
+        lastRefreshTime: new Date().toISOString()
+      };
+    }
   }
 
   // ─── Schema & Query Execution ────────────────────────────────────
 
-  async getDatasetSchema(datasetId: string): Promise<PowerBISchemaColumn[]> {
+  async getDatasetTables(datasetId: string): Promise<string[]> {
+    if (this.useMock) {
+      return ['Inventory', 'Finance', 'Sourcing', 'Sales'];
+    }
+
+    const queries = [
+      'SELECT [Name] FROM $SYSTEM.TMSCHEMA_TABLES',
+      'SELECT [TABLE_NAME] FROM $SYSTEM.DBSCHEMA_TABLES WHERE [TABLE_TYPE] = \'TABLE\''
+    ];
+
+    for (const daxQuery of queries) {
+      try {
+        const result = await this.executeDatasetQuery(datasetId, daxQuery);
+        if (result.results && result.results[0]?.tables?.[0]?.rows) {
+          const rows = result.results[0].tables[0].rows;
+          if (rows.length > 0) {
+            const firstRow = rows[0];
+            const nameKey = Object.keys(firstRow).find(k => 
+              k.toLowerCase().includes('name') || k.toLowerCase().includes('table_name')
+            );
+            
+            if (nameKey) {
+              const tableNames = rows
+                .map(row => row[nameKey])
+                .filter(name => {
+                  if (!name) return false;
+                  const lower = name.toLowerCase();
+                  return !lower.startsWith('rownumber') && 
+                         !lower.startsWith('$local') && 
+                         !lower.includes('localdatetable') &&
+                         !lower.includes('variation') &&
+                         !lower.startsWith('datetabletemplate_');
+                });
+              
+              this.logger.log(`Discovered ${tableNames.length} visible tables for dataset ${datasetId}`);
+              return tableNames;
+            }
+          }
+        }
+      } catch (e) {
+        this.logger.warn(`Query "${daxQuery}" failed for dataset ${datasetId}: ${e.message}`);
+      }
+    }
+
+    this.logger.error(`All table detection queries failed for dataset ${datasetId}`);
+    return [];
+  }
+
+  async getDatasetSchema(datasetId: string, tableName?: string): Promise<PowerBISchemaColumn[]> {
     if (this.useMock) {
       return [
         { name: 'ID', dataType: 'Int64', sanitizedName: 'id' },
@@ -190,16 +282,83 @@ export class PowerbiService {
       ];
     }
 
-    const daxQuery = 'SELECT [Name], [DataType] FROM $SYSTEM.TMSCHEMA_COLUMNS';
-    const result = await this.executeDatasetQuery(datasetId, daxQuery);
+    if (!tableName) {
+      const tables = await this.getDatasetTables(datasetId);
+      if (tables.length > 0) {
+        tableName = tables[0];
+      } else {
+        throw new Error('No tables found in dataset.');
+      }
+    }
+
+    // Use DBSCHEMA_COLUMNS for most reliable schema detection
+    // Prioritize EVALUATE TOPN(1) as it returns exactly what the user sees in the report
+    const cleanTableName = tableName.startsWith('$') ? tableName.substring(1) : tableName;
+    const evalQuery = `EVALUATE TOPN(1, '${cleanTableName.replace(/'/g, "''")}')`;
     
-    // Result from executeQueries is in a nested 'results' array
-    const columns = result.results[0].tables[0].rows;
-    return columns.map(col => ({
-      name: col['[Name]'],
-      dataType: col['[DataType]'],
-      sanitizedName: this.sanitizeName(col['[Name]'])
-    }));
+    try {
+      const evalResult = await this.executeDatasetQuery(datasetId, evalQuery);
+      if (evalResult.results?.[0]?.tables?.[0]?.rows) {
+        const evalRows = evalResult.results[0].tables[0].rows;
+        if (evalRows.length > 0) {
+          const firstRow = evalRows[0];
+          const columns = Object.keys(firstRow)
+            .filter(key => !key.startsWith('RowNumber-'))
+            .map(key => ({
+              name: key,
+              dataType: 'String', 
+              sanitizedName: this.sanitizeName(key)
+            }));
+          
+          if (columns.length > 0) {
+            return columns;
+          }
+        }
+      }
+    } catch (evalError) {
+      this.logger.warn(`EVALUATE failed for "${cleanTableName}": ${evalError.message}. Trying DMV...`);
+    }
+
+    // Fallback to DBSCHEMA_COLUMNS
+    try {
+      let daxQuery = `SELECT [COLUMN_NAME], [DATA_TYPE] FROM $SYSTEM.DBSCHEMA_COLUMNS WHERE [TABLE_NAME] = '${cleanTableName.replace(/'/g, "''")}'`;
+      let result = await this.executeDatasetQuery(datasetId, daxQuery);
+      let rows = result.results?.[0]?.tables?.[0]?.rows || [];
+
+      if (rows.length === 0 && cleanTableName !== tableName) {
+        daxQuery = `SELECT [COLUMN_NAME], [DATA_TYPE] FROM $SYSTEM.DBSCHEMA_COLUMNS WHERE [TABLE_NAME] = '${tableName.replace(/'/g, "''")}'`;
+        result = await this.executeDatasetQuery(datasetId, daxQuery);
+        rows = result.results?.[0]?.tables?.[0]?.rows || [];
+      }
+
+      if (rows.length > 0) {
+        const columns = rows.map(row => {
+          const name = row['[COLUMN_NAME]'] || row['COLUMN_NAME'];
+          const typeId = row['[DATA_TYPE]'] || row['DATA_TYPE'];
+          
+          let dataType = 'String';
+          if ([2, 3, 20].includes(typeId)) dataType = 'Int64';
+          if ([4, 5, 6, 14].includes(typeId)) dataType = 'Double';
+          if ([7, 133, 134, 135].includes(typeId)) dataType = 'DateTime';
+          if ([11].includes(typeId)) dataType = 'Boolean';
+
+          return {
+            name: name,
+            dataType: dataType,
+            sanitizedName: this.sanitizeName(name)
+          };
+        }).filter(col => !col.name.startsWith('RowNumber-'));
+
+        if (columns.length > 0) {
+          return columns;
+        }
+      }
+
+      throw new Error(`Could not detect schema for table "${tableName}".`);
+    } catch (e) {
+      this.logger.error(`Schema detection failed for ${tableName}: ${e.message}`);
+      throw e;
+    }
   }
 
   async executeDatasetQuery(datasetId: string, dax: string): Promise<any> {
@@ -217,18 +376,31 @@ export class PowerbiService {
     }
 
     const token = await this.getAccessToken();
-    const response = await firstValueFrom(
-      this.httpService.post(
-        `https://api.powerbi.com/v1.0/myorg/datasets/${datasetId}/executeQueries`,
-        { queries: [{ query: dax }] },
-        { headers: { Authorization: `Bearer ${token}` } },
-      ),
-    );
-    return response.data;
+    try {
+      const response = await firstValueFrom(
+        this.httpService.post(
+          `https://api.powerbi.com/v1.0/myorg/datasets/${datasetId}/executeQueries`,
+          { queries: [{ query: dax }] },
+          { headers: { Authorization: `Bearer ${token}` } },
+        ),
+      );
+      return response.data;
+    } catch (e) {
+      const errorData = e.response?.data;
+      this.logger.error(`DAX Query Failed: ${dax}`);
+      this.logger.error(`Error Details: ${JSON.stringify(errorData || e.message)}`);
+      throw new Error(errorData?.error?.message || e.message);
+    }
   }
 
-  private sanitizeName(name: string): string {
-    return name
+  public sanitizeName(name: string): string {
+    // Handle Table[Column] format from DAX
+    let cleanName = name;
+    if (name.includes('[') && name.endsWith(']')) {
+      const match = name.match(/\[(.*?)\]/);
+      if (match) cleanName = match[1];
+    }
+    return cleanName
       .toLowerCase()
       .replace(/[^a-z0-9]/g, '_') // Replace non-alphanumeric with underscore
       .replace(/_+/g, '_')        // Remove double underscores
@@ -413,18 +585,33 @@ export class PowerbiService {
   async syncReportsToCache() {
     try {
       this.logger.log('Starting Power BI report cache synchronization...');
-      const reports = await this.getReports();
       
-      for (const report of reports) {
-        await this.cacheRepository.upsert({
-          id: report.id,
-          name: report.name,
-          datasetId: report.datasetId,
-          workspaceId: 'cda4f662-6824-4e18-9cc3-ac5c56dcb8db', // Mock workspace ID
-        }, ['id']);
+      // Get all workspaces the SP has access to
+      const workspaces = await this.getWorkspaces();
+      this.logger.log(`Found ${workspaces.length} accessible workspaces.`);
+      
+      let totalSynced = 0;
+      
+      for (const workspace of workspaces) {
+        try {
+          const reports = await this.getReportsInGroup(workspace.id);
+          this.logger.log(`Syncing ${reports.length} reports from workspace: ${workspace.name}`);
+          
+          for (const report of reports) {
+            await this.cacheRepository.upsert({
+              id: report.id,
+              name: report.name,
+              datasetId: report.datasetId,
+              workspaceId: workspace.id,
+            }, ['id']);
+            totalSynced++;
+          }
+        } catch (wsError) {
+          this.logger.warn(`Failed to sync reports for workspace ${workspace.name}: ${wsError.message}`);
+        }
       }
       
-      this.logger.log(`Successfully synced ${reports.length} reports to cache.`);
+      this.logger.log(`Successfully synced ${totalSynced} reports to cache.`);
     } catch (error) {
       this.logger.error(`Failed to sync reports to cache: ${error.message}`);
     }
