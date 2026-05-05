@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, QueryRunner } from 'typeorm';
 import { SchedulerRegistry } from '@nestjs/schedule';
@@ -36,7 +36,7 @@ export class AutomationService implements OnApplicationBootstrap {
     });
     
     if (existing) {
-       throw new Error(`Table "${data.pbiTableName}" in report "${data.reportName}" is already scheduled.`);
+       throw new ConflictException(`Table "${data.pbiTableName}" in report "${data.reportName}" is already scheduled.`);
     }
 
     // 1. Get Schema
